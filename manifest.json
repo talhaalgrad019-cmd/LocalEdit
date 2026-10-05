@@ -1,0 +1,8 @@
+{
+  "name": "Local Edit",
+  "description": "Edit any message locally (text and images). Only you see it.",
+  "authors": [{ "name": "Abas2" }],
+  "main": "index.js",
+  "hash": "f66d8ed9068d575532736dffdf697b0e1ae7c7811b4cb980f4ee496d4c8823ac",
+  "vendetta": { "icon": "ic_message_edit" }
+}
