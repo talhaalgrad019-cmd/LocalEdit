@@ -233,51 +233,137 @@
     toast("Edited locally");
   }
 
-  function askImages(message, text, currentUrls) {
-    const alerts = vendetta.ui.alerts;
-    alerts.showInputAlert({
-      title: "Image links (optional)",
-      initialValue: currentUrls.join(" "),
-      placeholder: "https://... (space between links, empty = no images)",
-      confirmText: "Save",
-      cancelText: "Cancel",
-      onConfirm: function (value) {
-        const urls = String(value || "")
-          .split(/\s+/)
-          .filter(function (u) { return /^https?:\/\//i.test(u); });
-        if (!text && !urls.length) {
-          toast("Nothing to show: add text or an image link");
-          return;
-        }
-        buildAttachments(urls, message).then(function (atts) {
-          applyEdit(message, text, atts);
-        });
-      },
+  // Own editor sheet (the built-in input dialog crashes on this Discord build)
+  let sheetStyles = null;
+  let ActionSheetComp = null;
+
+  function getSheetStyles() {
+    if (!sheetStyles) {
+      const C = vendetta.ui.semanticColors;
+      const text = C.TEXT_NORMAL || C.HEADER_SECONDARY;
+      sheetStyles = common.stylesheet.createThemedStyleSheet({
+        wrap: { padding: 16 },
+        title: { color: text, fontSize: 18, fontWeight: "700", marginBottom: 4 },
+        label: { color: C.TEXT_MUTED, fontSize: 12, fontWeight: "600", marginTop: 14, marginBottom: 6 },
+        input: {
+          color: text,
+          backgroundColor: "rgba(127,127,127,0.18)",
+          borderRadius: 8,
+          paddingHorizontal: 12,
+          paddingVertical: 10,
+          fontSize: 16,
+          minHeight: 44,
+          maxHeight: 160,
+          textAlignVertical: "top",
+        },
+        row: { flexDirection: "row", justifyContent: "flex-end", marginTop: 18, marginBottom: 8 },
+        btn: { paddingHorizontal: 20, paddingVertical: 12, borderRadius: 8, marginLeft: 8 },
+        cancel: { backgroundColor: "rgba(127,127,127,0.25)" },
+        save: { backgroundColor: "#5865F2" },
+        cancelText: { color: text, fontWeight: "600" },
+        saveText: { color: "#FFFFFF", fontWeight: "600" },
+      });
+    }
+    return sheetStyles;
+  }
+
+  function EditSheet(props) {
+    const st = getSheetStyles();
+    const textState = React.useState(props.text);
+    const linkState = React.useState(props.links);
+    ActionSheetComp = ActionSheetComp || (findByProps("ActionSheet") || {}).ActionSheet || RN.View;
+
+    return React.createElement(
+      ActionSheetComp,
+      null,
+      React.createElement(
+        RN.View,
+        { style: st.wrap },
+        React.createElement(RN.Text, { style: st.title }, "Edit message (local only)"),
+        React.createElement(RN.Text, { style: st.label }, "TEXT"),
+        React.createElement(RN.TextInput, {
+          style: st.input,
+          value: textState[0],
+          onChangeText: textState[1],
+          multiline: true,
+          placeholder: "Message text",
+          placeholderTextColor: "#8e9297",
+        }),
+        React.createElement(RN.Text, { style: st.label }, "IMAGE LINKS (space between links)"),
+        React.createElement(RN.TextInput, {
+          style: st.input,
+          value: linkState[0],
+          onChangeText: linkState[1],
+          multiline: true,
+          autoCapitalize: "none",
+          autoCorrect: false,
+          placeholder: "https://...",
+          placeholderTextColor: "#8e9297",
+        }),
+        React.createElement(
+          RN.View,
+          { style: st.row },
+          React.createElement(
+            RN.TouchableOpacity,
+            { style: [st.btn, st.cancel], onPress: function () { try { LazyActionSheet.hideActionSheet(); } catch (e) {} } },
+            React.createElement(RN.Text, { style: st.cancelText }, "Cancel")
+          ),
+          React.createElement(
+            RN.TouchableOpacity,
+            { style: [st.btn, st.save], onPress: function () { props.onSave(textState[0], linkState[0]); } },
+            React.createElement(RN.Text, { style: st.saveText }, "Save")
+          )
+        )
+      )
+    );
+  }
+
+  function saveEdit(message, text, linksRaw) {
+    const urls = String(linksRaw || "")
+      .split(/\s+/)
+      .filter(function (u) { return /^https?:\/\//i.test(u); });
+    if (!text && !urls.length) {
+      toast("Nothing to show: add text or an image link");
+      return;
+    }
+    buildAttachments(urls, message).then(function (atts) {
+      applyEdit(message, text, atts);
     });
   }
 
-  function startEdit(message) {
-    const alerts = vendetta.ui.alerts;
-    if (!alerts || !alerts.showInputAlert) {
-      toast("LocalEdit: input dialog not available");
-      return;
-    }
+  function openEditSheet(message) {
     const k = keyOf(message);
     const existing = k && edits()[k];
     const text = existing ? existing.content : typeof message.content === "string" ? message.content : "";
-    const urls = (existing ? existing.attachments : attList(message)).map(function (a) { return a.url; });
+    const links = (existing ? existing.attachments : attList(message))
+      .map(function (a) { return a.url; })
+      .join(" ");
+    try {
+      LazyActionSheet.openLazy(
+        Promise.resolve({
+          default: function () {
+            return React.createElement(EditSheet, {
+              text: text,
+              links: links,
+              onSave: function (newText, newLinks) {
+                try { LazyActionSheet.hideActionSheet(); } catch (e) {}
+                saveEdit(message, newText, newLinks);
+              },
+            });
+          },
+        }),
+        "local-edit-sheet-" + message.id,
+        {}
+      );
+    } catch (e) {
+      console.error("[LocalEdit] could not open editor", e);
+      toast("LocalEdit: could not open editor");
+    }
+  }
 
-    alerts.showInputAlert({
-      title: "Edit message (local only)",
-      initialValue: text.replace(/\n/g, "\\n"),
-      placeholder: "New text (type \\n for a new line)",
-      confirmText: "Next",
-      cancelText: "Cancel",
-      onConfirm: function (value) {
-        const newText = String(value || "").replace(/\\n/g, "\n");
-        setTimeout(function () { askImages(message, newText, urls); }, 300);
-      },
-    });
+  function startEdit(message) {
+    // let the long-press menu finish closing first
+    setTimeout(function () { openEditSheet(message); }, 250);
   }
 
   // ---------- long-press menu rows ----------
@@ -431,4 +517,4 @@
     },
     __esModule: true,
   };
-})();
+})(); 
