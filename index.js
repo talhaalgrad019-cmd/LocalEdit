@@ -16,6 +16,7 @@
   let installed = false;
   let installTimer = null;
   let ChannelStore = null;
+  let MessageStore = null;
   let SelectedChannelStore = null;
   let RestAPI = null;
   let guardTimer = null;
@@ -55,6 +56,34 @@
     } catch (e) {
       return undefined;
     }
+  }
+
+  function copy(text) {
+    try {
+      const cb = findByProps("setString");
+      if (cb && cb.setString) cb.setString(text);
+    } catch (e) {}
+  }
+
+  // What does Discord's own chat memory hold for this message right now?
+  function storeInfo(channelId, id) {
+    try {
+      MessageStore = MessageStore || findByStoreName("MessageStore");
+      const m = MessageStore && MessageStore.getMessage(channelId, id);
+      if (!m) return { inStore: false };
+      return {
+        inStore: true,
+        content: m.content,
+        attachmentCount: m.attachments ? Array.from(m.attachments).length : 0,
+        keys: Object.keys(m).slice(0, 40),
+      };
+    } catch (e) {
+      return { inStore: false, error: String(e) };
+    }
+  }
+
+  function wait(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
   function attKey(list) {
@@ -153,9 +182,21 @@
   }
 
   function reapply(action) {
-    if (!action || action.__localEdit || !REAPPLY_TYPES.test(String(action.type))) return;
+    if (!action || action.__localEdit) return;
     const all = edits();
     if (!Object.keys(all).length) return;
+
+    // opening a channel: re-apply its saved edits once its messages have loaded
+    if (action.type === "CHANNEL_SELECT" && action.channelId) {
+      Object.keys(all).forEach(function (k) {
+        const e = all[k];
+        if (e.channelId !== action.channelId) return;
+        setTimeout(function () { schedule(k + ":select", function () { applyStored(e); }); }, 800);
+      });
+      return;
+    }
+
+    if (!REAPPLY_TYPES.test(String(action.type))) return;
     collect(action, [], new Set(), 0).forEach(function (m) {
       const k = keyOf(m.channel_id || m.channelId, m.id);
       const e = all[k];
@@ -290,6 +331,7 @@
     const statusState = React.useState("");
     const busyState = React.useState(false);
     const rawRef = React.useRef(null);
+    const debugRef = React.useRef("");
 
     const channelId = channelState[0];
     const messageId = messageState[0];
@@ -349,11 +391,33 @@
         return;
       }
       busyState[1](true);
+      const before = storeInfo(id.c, id.m);
       saveEdit(id.c, raw, text, urls)
+        .then(function () { return wait(600); })
         .then(function () {
+          let info = storeInfo(id.c, id.m);
+          if (info.inStore && info.content !== text) {
+            // try once more in case the first update raced with something
+            applyStored(edits()[keyOf(id.c, id.m)]);
+            return wait(600).then(function () { return storeInfo(id.c, id.m); });
+          }
+          return info;
+        })
+        .then(function (info) {
+          debugRef.current = JSON.stringify(
+            { channel: id.c, message: id.m, expected: text, before: before, after: info },
+            null,
+            1
+          );
           loadedState[1]({ shown: text, edited: true, author: loaded ? loaded.author : "" });
-          statusState[1]("Updated locally. Open the channel to see it.");
-          toast("Edited locally");
+          if (!info.inStore) {
+            statusState[1]("Saved, but Discord doesn't have this message loaded right now. Open the channel and scroll to it. The edit applies by itself when it loads.");
+          } else if (info.content === text) {
+            statusState[1]("Done. Discord's chat now has the new text. Go back to the channel to see it.");
+            toast("Edited locally");
+          } else {
+            statusState[1]("Discord ignored the update (its copy still has the old text). Tap Copy debug info and send it to me.");
+          }
         })
         .catch(function (e) {
           statusState[1]("Update failed: " + (e && e.message ? e.message : String(e)));
@@ -447,7 +511,17 @@
           )
         : null,
 
-      statusState[0] ? React.createElement(RN.Text, { style: st.status }, statusState[0]) : null
+      statusState[0] ? React.createElement(RN.Text, { style: st.status }, statusState[0]) : null,
+      loaded
+        ? React.createElement(Button, {
+            label: "Copy debug info",
+            kind: "secondary",
+            onPress: function () {
+              copy(debugRef.current || "no update yet");
+              toast("Debug info copied");
+            },
+          })
+        : null
     );
   }
 
