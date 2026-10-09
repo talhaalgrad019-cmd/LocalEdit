@@ -6,19 +6,19 @@
   const FluxDispatcher = common.FluxDispatcher;
   const React = common.React;
   const RN = common.ReactNative;
-  const { before, after } = vendetta.patcher;
-  const { findInReactTree } = vendetta.utils;
+  const { after } = vendetta.patcher;
   const storage = vendetta.plugin.storage;
 
   const REAPPLY_TYPES = /^(MESSAGE_CREATE|MESSAGE_UPDATE|LOAD_MESSAGES)/;
 
   const unpatches = [];
   const pending = {};
-  let installTimer = null;
   let installed = false;
-  let LazyActionSheet = null;
-  let ActionSheetRow = null;
+  let installTimer = null;
   let ChannelStore = null;
+  let SelectedChannelStore = null;
+  let RestAPI = null;
+  let guardTimer = null;
   let styles = null;
 
   // ---------- helpers ----------
@@ -34,44 +34,26 @@
     return storage.localEdits;
   }
 
-  function chanId(m) {
-    return m && (m.channel_id || m.channelId);
+  function keyOf(channelId, id) {
+    return channelId + ":" + id;
   }
 
-  function keyOf(m) {
-    const c = chanId(m);
-    return c && m && m.id ? c + ":" + m.id : null;
+  function currentChannelId() {
+    try {
+      SelectedChannelStore = SelectedChannelStore || findByStoreName("SelectedChannelStore");
+      return (SelectedChannelStore && SelectedChannelStore.getChannelId()) || "";
+    } catch (e) {
+      return "";
+    }
   }
 
   function guildOf(channelId) {
     try {
+      ChannelStore = ChannelStore || findByStoreName("ChannelStore");
       const ch = ChannelStore && ChannelStore.getChannel(channelId);
       return (ch && (ch.guild_id || ch.guildId)) || undefined;
     } catch (e) {
       return undefined;
-    }
-  }
-
-  function simpleAtt(a) {
-    return {
-      id: String(a.id),
-      filename: a.filename || "image.png",
-      size: a.size || 0,
-      url: a.url,
-      proxy_url: a.proxy_url || a.proxyURL || a.url,
-      width: a.width,
-      height: a.height,
-      content_type: a.content_type || a.contentType || "image/png",
-    };
-  }
-
-  function attList(message) {
-    try {
-      return Array.from((message && message.attachments) || [])
-        .filter(function (a) { return a && a.url; })
-        .map(simpleAtt);
-    } catch (e) {
-      return [];
     }
   }
 
@@ -93,39 +75,66 @@
     }, 0);
   }
 
+  // Crash guard: if Discord crashes while rendering an edit, clear saved edits on next start
+  function armGuard() {
+    storage.guard = Date.now();
+    clearTimeout(guardTimer);
+    guardTimer = setTimeout(function () { delete storage.guard; }, 4000);
+  }
+
+  // ---------- loading the real message from Discord (read-only request) ----------
+
+  function fetchMessage(channelId, id) {
+    RestAPI = RestAPI || findByProps("get", "post", "del", "patch");
+    if (!RestAPI) return Promise.reject(new Error("REST module not found"));
+    return RestAPI.get({
+      url: "/channels/" + channelId + "/messages",
+      query: { limit: 1, around: id },
+    }).then(function (res) {
+      const list = res && res.body;
+      const msg = Array.isArray(list)
+        ? list.filter(function (m) { return m && m.id === id; })[0]
+        : null;
+      if (!msg) throw new Error("Message not found in that channel");
+      return msg;
+    });
+  }
+
   // ---------- applying edits (local only: nothing is sent to Discord) ----------
 
-  function sendUpdate(channelId, id, content, attachments, editedTs) {
-    const message = {
-      id: id,
-      channel_id: channelId,
-      content: content,
-      attachments: attachments,
-      edited_timestamp: editedTs,
-    };
+  function sendMessage(msg, channelId) {
     const gid = guildOf(channelId);
-    if (gid) message.guild_id = gid;
+    const out = Object.assign({}, msg);
+    if (gid && !out.guild_id) out.guild_id = gid;
+    armGuard();
     FluxDispatcher.dispatch({
       type: "MESSAGE_UPDATE",
       guildId: gid,
-      message: message,
+      message: out,
       __localEdit: true,
     });
   }
 
   function applyStored(e) {
-    sendUpdate(e.channelId, e.id, e.content, e.attachments, e.editedAt);
+    if (!e || !e.raw) return;
+    sendMessage(
+      Object.assign({}, e.raw, {
+        content: e.content,
+        attachments: e.attachments,
+        edited_timestamp: e.editedAt,
+      }),
+      e.channelId
+    );
   }
 
-  function resetEdit(message) {
-    const k = keyOf(message);
+  function removeEdit(channelId, id) {
     const all = edits();
-    const e = k && all[k];
-    if (!e) return;
-    const o = e.original || {};
-    sendUpdate(e.channelId, e.id, o.content || "", o.attachments || [], o.edited_timestamp || null);
+    const k = keyOf(channelId, id);
+    const e = all[k];
+    if (!e) return false;
+    if (e.raw) sendMessage(e.raw, channelId); // raw = the original, as Discord sent it
     delete all[k];
-    toast("Local edit removed");
+    return true;
   }
 
   // Re-apply saved edits when Discord (re)loads those messages
@@ -148,8 +157,8 @@
     const all = edits();
     if (!Object.keys(all).length) return;
     collect(action, [], new Set(), 0).forEach(function (m) {
-      const k = keyOf(m);
-      const e = k && all[k];
+      const k = keyOf(m.channel_id || m.channelId, m.id);
+      const e = all[k];
       if (!e) return;
       if (typeof m.content !== "string" && m.attachments === undefined) return;
       if (m.content === e.content && attKey(m.attachments) === attKey(e.attachments)) return;
@@ -157,7 +166,7 @@
     });
   }
 
-  // ---------- edit flow (text, then image links) ----------
+  // ---------- images ----------
 
   function sizeOf(url) {
     return new Promise(function (resolve) {
@@ -182,17 +191,16 @@
     return m[1] === "gif" ? "image/gif" : m[1] === "webp" ? "image/webp" : m[1] === "png" ? "image/png" : "image/jpeg";
   }
 
-  function buildAttachments(urls, message) {
-    const existing = attList(message);
+  function buildAttachments(urls, rawAttachments) {
+    const existing = Array.from(rawAttachments || []);
     return Promise.all(
       urls.map(function (url, i) {
-        const same = existing.filter(function (a) { return a.url === url; })[0];
+        const same = existing.filter(function (a) { return a && a.url === url; })[0];
         if (same) return same;
         return sizeOf(url).then(function (dim) {
-          const name = String(url).split("?")[0].split("/").pop() || "image.png";
           return {
             id: String(Date.now()) + i,
-            filename: name,
+            filename: String(url).split("?")[0].split("/").pop() || "image.png",
             size: 0,
             url: url,
             proxy_url: url,
@@ -205,46 +213,32 @@
     );
   }
 
-  function applyEdit(message, text, atts) {
-    const k = keyOf(message);
-    if (!k) {
-      toast("LocalEdit: missing message ids");
-      return;
-    }
-    const all = edits();
-    if (!all[k]) {
-      const et = message.editedTimestamp || message.edited_timestamp;
-      let etIso = null;
-      try { etIso = et ? new Date(et).toISOString() : null; } catch (e) {}
-      all[k] = {
-        channelId: chanId(message),
-        id: message.id,
-        original: {
-          content: typeof message.content === "string" ? message.content : "",
-          attachments: attList(message),
-          edited_timestamp: etIso,
-        },
+  function saveEdit(channelId, raw, text, urls) {
+    return buildAttachments(urls, raw.attachments).then(function (atts) {
+      const all = edits();
+      all[keyOf(channelId, raw.id)] = {
+        channelId: channelId,
+        id: raw.id,
+        raw: raw,
+        content: text,
+        attachments: atts,
+        editedAt: new Date().toISOString(),
       };
-    }
-    all[k].content = text;
-    all[k].attachments = atts;
-    all[k].editedAt = new Date().toISOString();
-    applyStored(all[k]);
-    toast("Edited locally");
+      applyStored(all[keyOf(channelId, raw.id)]);
+    });
   }
 
-  // Own editor sheet (the built-in input dialog crashes on this Discord build)
-  let sheetStyles = null;
-  let ActionSheetComp = null;
+  // ---------- settings page ----------
 
-  function getSheetStyles() {
-    if (!sheetStyles) {
+  function getStyles() {
+    if (!styles) {
       const C = vendetta.ui.semanticColors;
       const text = C.TEXT_NORMAL || C.HEADER_SECONDARY;
-      sheetStyles = common.stylesheet.createThemedStyleSheet({
-        wrap: { padding: 16 },
-        title: { color: text, fontSize: 18, fontWeight: "700", marginBottom: 4 },
-        label: { color: C.TEXT_MUTED, fontSize: 12, fontWeight: "600", marginTop: 14, marginBottom: 6 },
+      styles = common.stylesheet.createThemedStyleSheet({
+        page: { padding: 16, paddingBottom: 60 },
+        title: { color: text, fontSize: 20, fontWeight: "700" },
+        hint: { color: C.TEXT_MUTED, fontSize: 13, marginTop: 4, marginBottom: 6 },
+        label: { color: C.TEXT_MUTED, fontSize: 12, fontWeight: "600", marginTop: 16, marginBottom: 6 },
         input: {
           color: text,
           backgroundColor: "rgba(127,127,127,0.18)",
@@ -253,233 +247,224 @@
           paddingVertical: 10,
           fontSize: 16,
           minHeight: 44,
-          maxHeight: 160,
           textAlignVertical: "top",
         },
-        row: { flexDirection: "row", justifyContent: "flex-end", marginTop: 18, marginBottom: 8 },
-        btn: { paddingHorizontal: 20, paddingVertical: 12, borderRadius: 8, marginLeft: 8 },
-        cancel: { backgroundColor: "rgba(127,127,127,0.25)" },
-        save: { backgroundColor: "#5865F2" },
-        cancelText: { color: text, fontWeight: "600" },
-        saveText: { color: "#FFFFFF", fontWeight: "600" },
+        box: {
+          backgroundColor: "rgba(127,127,127,0.12)",
+          borderRadius: 8,
+          padding: 12,
+        },
+        boxText: { color: text, fontSize: 15 },
+        btn: { paddingVertical: 13, borderRadius: 8, alignItems: "center", marginTop: 14 },
+        primary: { backgroundColor: "#5865F2" },
+        secondary: { backgroundColor: "rgba(127,127,127,0.3)" },
+        danger: { backgroundColor: "#da373c" },
+        disabled: { opacity: 0.45 },
+        btnText: { color: "#FFFFFF", fontWeight: "700", fontSize: 15 },
+        status: { color: C.TEXT_MUTED, fontSize: 13, marginTop: 14 },
       });
     }
-    return sheetStyles;
+    return styles;
   }
 
-  function EditSheet(props) {
-    const st = getSheetStyles();
-    const textState = React.useState(props.text);
-    const linkState = React.useState(props.links);
-    ActionSheetComp = ActionSheetComp || (findByProps("ActionSheet") || {}).ActionSheet || RN.View;
+  function Button(props) {
+    const st = getStyles();
+    return React.createElement(
+      RN.TouchableOpacity,
+      {
+        style: [st.btn, st[props.kind || "primary"], props.disabled ? st.disabled : null],
+        disabled: !!props.disabled,
+        onPress: props.onPress,
+      },
+      React.createElement(RN.Text, { style: st.btnText }, props.label)
+    );
+  }
+
+  function SettingsPage() {
+    const st = getStyles();
+    const channelState = React.useState(currentChannelId());
+    const messageState = React.useState("");
+    const loadedState = React.useState(null); // { shown, edited, author }
+    const textState = React.useState("");
+    const linksState = React.useState("");
+    const statusState = React.useState("");
+    const busyState = React.useState(false);
+    const rawRef = React.useRef(null);
+
+    const channelId = channelState[0];
+    const messageId = messageState[0];
+    const loaded = loadedState[0];
+    const busy = busyState[0];
+
+    function ids() {
+      const c = String(channelId || "").trim();
+      const m = String(messageId || "").trim();
+      if (!/^\d+$/.test(c) || !/^\d+$/.test(m)) return null;
+      return { c: c, m: m };
+    }
+
+    function load() {
+      const id = ids();
+      if (!id) {
+        statusState[1]("Enter the channel ID and message ID (numbers only).");
+        return;
+      }
+      busyState[1](true);
+      statusState[1]("Loading...");
+      fetchMessage(id.c, id.m)
+        .then(function (raw) {
+          rawRef.current = raw;
+          const existing = edits()[keyOf(id.c, id.m)];
+          const shown = existing ? existing.content : raw.content || "";
+          const urls = (existing ? existing.attachments : raw.attachments || []).map(function (a) { return a.url; });
+          loadedState[1]({
+            shown: shown,
+            edited: !!existing,
+            author: raw.author ? raw.author.global_name || raw.author.username : "",
+          });
+          textState[1](shown);
+          linksState[1](urls.join(" "));
+          statusState[1]("Loaded. Change the text below, then press Update.");
+        })
+        .catch(function (e) {
+          loadedState[1](null);
+          statusState[1]("Could not load: " + (e && e.message ? e.message : String(e)));
+        })
+        .then(function () { busyState[1](false); });
+    }
+
+    function update() {
+      const id = ids();
+      const raw = rawRef.current;
+      if (!id || !raw || raw.id !== id.m) {
+        statusState[1]("Press Load message first.");
+        return;
+      }
+      const text = String(textState[0] || "");
+      const urls = String(linksState[0] || "")
+        .split(/\s+/)
+        .filter(function (u) { return /^https?:\/\//i.test(u); });
+      if (!text && !urls.length) {
+        statusState[1]("Add some text or an image link.");
+        return;
+      }
+      busyState[1](true);
+      saveEdit(id.c, raw, text, urls)
+        .then(function () {
+          loadedState[1]({ shown: text, edited: true, author: loaded ? loaded.author : "" });
+          statusState[1]("Updated locally. Open the channel to see it.");
+          toast("Edited locally");
+        })
+        .catch(function (e) {
+          statusState[1]("Update failed: " + (e && e.message ? e.message : String(e)));
+        })
+        .then(function () { busyState[1](false); });
+    }
+
+    function remove() {
+      const id = ids();
+      if (!id) return;
+      if (removeEdit(id.c, id.m)) {
+        statusState[1]("Local edit removed.");
+        toast("Local edit removed");
+        load();
+      }
+    }
 
     return React.createElement(
-      ActionSheetComp,
-      null,
+      RN.ScrollView,
+      { contentContainerStyle: st.page, keyboardShouldPersistTaps: "handled" },
+      React.createElement(RN.Text, { style: st.title }, "Local Edit"),
       React.createElement(
-        RN.View,
-        { style: st.wrap },
-        React.createElement(RN.Text, { style: st.title }, "Edit message (local only)"),
-        React.createElement(RN.Text, { style: st.label }, "TEXT"),
-        React.createElement(RN.TextInput, {
-          style: st.input,
-          value: textState[0],
-          onChangeText: textState[1],
-          multiline: true,
-          placeholder: "Message text",
-          placeholderTextColor: "#8e9297",
-        }),
-        React.createElement(RN.Text, { style: st.label }, "IMAGE LINKS (space between links)"),
-        React.createElement(RN.TextInput, {
-          style: st.input,
-          value: linkState[0],
-          onChangeText: linkState[1],
-          multiline: true,
-          autoCapitalize: "none",
-          autoCorrect: false,
-          placeholder: "https://...",
-          placeholderTextColor: "#8e9297",
-        }),
-        React.createElement(
-          RN.View,
-          { style: st.row },
-          React.createElement(
-            RN.TouchableOpacity,
-            { style: [st.btn, st.cancel], onPress: function () { try { LazyActionSheet.hideActionSheet(); } catch (e) {} } },
-            React.createElement(RN.Text, { style: st.cancelText }, "Cancel")
-          ),
-          React.createElement(
-            RN.TouchableOpacity,
-            { style: [st.btn, st.save], onPress: function () { props.onSave(textState[0], linkState[0]); } },
-            React.createElement(RN.Text, { style: st.saveText }, "Save")
-          )
-        )
-      )
-    );
-  }
+        RN.Text,
+        { style: st.hint },
+        "Changes how a message looks for you only. Nothing is sent to Discord. Turn on Developer Mode in Discord to copy message IDs."
+      ),
 
-  function saveEdit(message, text, linksRaw) {
-    const urls = String(linksRaw || "")
-      .split(/\s+/)
-      .filter(function (u) { return /^https?:\/\//i.test(u); });
-    if (!text && !urls.length) {
-      toast("Nothing to show: add text or an image link");
-      return;
-    }
-    buildAttachments(urls, message).then(function (atts) {
-      applyEdit(message, text, atts);
-    });
-  }
-
-  function openEditSheet(message) {
-    const k = keyOf(message);
-    const existing = k && edits()[k];
-    const text = existing ? existing.content : typeof message.content === "string" ? message.content : "";
-    const links = (existing ? existing.attachments : attList(message))
-      .map(function (a) { return a.url; })
-      .join(" ");
-    try {
-      LazyActionSheet.openLazy(
-        Promise.resolve({
-          default: function () {
-            return React.createElement(EditSheet, {
-              text: text,
-              links: links,
-              onSave: function (newText, newLinks) {
-                try { LazyActionSheet.hideActionSheet(); } catch (e) {}
-                saveEdit(message, newText, newLinks);
-              },
-            });
-          },
-        }),
-        "local-edit-sheet-" + message.id,
-        {}
-      );
-    } catch (e) {
-      console.error("[LocalEdit] could not open editor", e);
-      toast("LocalEdit: could not open editor");
-    }
-  }
-
-  function startEdit(message) {
-    // let the long-press menu finish closing first
-    setTimeout(function () { openEditSheet(message); }, 250);
-  }
-
-  // ---------- long-press menu rows ----------
-
-  function iconId(names) {
-    try {
-      const get = vendetta.ui.assets.getAssetIDByName;
-      for (let i = 0; i < names.length; i++) {
-        const id = get(names[i]);
-        if (id) return id;
-      }
-    } catch (e) {}
-    return undefined;
-  }
-
-  function makeRow(key, label, names, onPress) {
-    ActionSheetRow = ActionSheetRow || (findByProps("ActionSheetRow") || {}).ActionSheetRow;
-    if (!ActionSheetRow) return null;
-    if (!styles) {
-      styles = common.stylesheet.createThemedStyleSheet({
-        icon: { width: 24, height: 24, tintColor: vendetta.ui.semanticColors.INTERACTIVE_NORMAL },
-      });
-    }
-    const icon = iconId(names);
-    return React.createElement(ActionSheetRow, {
-      key: key,
-      label: label,
-      icon: React.createElement(ActionSheetRow.Icon, {
-        source: icon,
-        IconComponent: function () {
-          return React.createElement(RN.Image, { resizeMode: "cover", style: styles.icon, source: icon });
-        },
+      React.createElement(RN.Text, { style: st.label }, "CHANNEL ID (filled with the channel you had open)"),
+      React.createElement(RN.TextInput, {
+        style: st.input,
+        value: channelId,
+        onChangeText: channelState[1],
+        keyboardType: "numeric",
+        placeholder: "Channel ID",
+        placeholderTextColor: "#8e9297",
       }),
-      onPress: function () {
-        try { LazyActionSheet.hideActionSheet(); } catch (e) {}
-        onPress();
-      },
-    });
-  }
 
-  function nameOf(el) {
-    try {
-      const t = el && el.type;
-      if (!t) return "";
-      return t.displayName || t.name || (t.render && t.render.name) || (t.type && t.type.name) || "";
-    } catch (e) {
-      return "";
-    }
-  }
+      React.createElement(RN.Text, { style: st.label }, "MESSAGE ID"),
+      React.createElement(RN.TextInput, {
+        style: st.input,
+        value: messageId,
+        onChangeText: messageState[1],
+        keyboardType: "numeric",
+        placeholder: "Message ID",
+        placeholderTextColor: "#8e9297",
+      }),
 
-  function findRows(tree) {
-    const old = findInReactTree(tree, function (x) {
-      return x && x[0] && x[0].type && x[0].type.name === "ButtonRow";
-    });
-    if (old) return old;
-    return findInReactTree(tree, function (x) {
-      if (!Array.isArray(x) || x.length < 2) return false;
-      const rowish = x.filter(function (el) { return /row|button|action|pressable|touchable/i.test(nameOf(el)); }).length >= 2;
-      const pressables = x.filter(function (el) {
-        return el && el.props && (typeof el.props.onPress === "function" || el.props.label || el.props.title);
-      }).length >= 2;
-      return rowish || pressables;
-    });
-  }
+      React.createElement(Button, { label: busy ? "Please wait..." : "Load message", onPress: load, disabled: busy }),
 
-  function installSheetPatch() {
-    unpatches.push(
-      before("openLazy", LazyActionSheet, function (args) {
-        const component = args[0];
-        const key = args[1];
-        const data = args[2];
-        if (key !== "MessageLongPressActionSheet") return;
-        const message = data && data.message;
-        if (!message || !component || typeof component.then !== "function") return;
+      loaded
+        ? React.createElement(
+            React.Fragment,
+            null,
+            React.createElement(
+              RN.Text,
+              { style: st.label },
+              "CURRENT TEXT" + (loaded.author ? " (by " + loaded.author + ")" : "") + (loaded.edited ? " - locally edited" : "")
+            ),
+            React.createElement(
+              RN.View,
+              { style: st.box },
+              React.createElement(RN.Text, { style: st.boxText, selectable: true }, loaded.shown || "(no text)")
+            ),
 
-        component.then(function (instance) {
-          const unpatch = after("default", instance, function (_, tree) {
-            React.useEffect(function () {
-              return function () { try { unpatch(); } catch (e) {} };
-            }, []);
+            React.createElement(RN.Text, { style: st.label }, "NEW TEXT"),
+            React.createElement(RN.TextInput, {
+              style: st.input,
+              value: textState[0],
+              onChangeText: textState[1],
+              multiline: true,
+              placeholder: "New message text",
+              placeholderTextColor: "#8e9297",
+            }),
 
-            const rows = findRows(tree);
-            if (!rows) return;
+            React.createElement(RN.Text, { style: st.label }, "IMAGE LINKS (space between links, optional)"),
+            React.createElement(RN.TextInput, {
+              style: st.input,
+              value: linksState[0],
+              onChangeText: linksState[1],
+              multiline: true,
+              autoCapitalize: "none",
+              autoCorrect: false,
+              placeholder: "https://...",
+              placeholderTextColor: "#8e9297",
+            }),
 
-            const add = [];
-            const editRow = makeRow("localedit-edit", "Edit (local)", ["ic_edit_24px", "ic_message_edit", "ic_edit"], function () {
-              startEdit(message);
-            });
-            if (editRow) add.push(editRow);
+            React.createElement(Button, { label: "Update", onPress: update, disabled: busy }),
+            loaded.edited
+              ? React.createElement(Button, { label: "Remove local edit", kind: "danger", onPress: remove, disabled: busy })
+              : null
+          )
+        : null,
 
-            const k = keyOf(message);
-            if (k && edits()[k]) {
-              const resetRow = makeRow("localedit-reset", "Remove local edit", ["ic_close_16px"], function () {
-                resetEdit(message);
-              });
-              if (resetRow) add.push(resetRow);
-            }
-            if (add.length) rows.splice.apply(rows, [Math.min(2, rows.length), 0].concat(add));
-          });
-        }).catch(function (e) {
-          console.error("[LocalEdit] sheet promise failed", e);
-        });
-      })
+      statusState[0] ? React.createElement(RN.Text, { style: st.status }, statusState[0]) : null
     );
   }
 
-  // ---------- startup (modules load lazily, so retry until ready) ----------
+  // ---------- startup ----------
 
   function tryInstall() {
     if (installed) return;
     try {
-      LazyActionSheet = LazyActionSheet || findByProps("openLazy", "hideActionSheet");
-      ChannelStore = ChannelStore || findByStoreName("ChannelStore");
-      if (!LazyActionSheet || !FluxDispatcher) return;
+      if (!FluxDispatcher) return;
 
-      installSheetPatch();
+      if (storage.guard) {
+        // last session ended right after applying an edit: assume it crashed, drop saved edits
+        storage.localEdits = {};
+        delete storage.guard;
+        toast("LocalEdit: last edit crashed the chat, saved edits cleared");
+      }
+
       unpatches.push(after("dispatch", FluxDispatcher, function (args) { reapply(args[0]); }));
       installed = true;
 
@@ -491,7 +476,6 @@
         const e = edits()[k];
         schedule(k, function () { applyStored(e); });
       });
-      toast("LocalEdit: ready");
     } catch (e) {
       console.error("[LocalEdit] install failed", e);
     }
@@ -508,12 +492,14 @@
           clearInterval(installTimer);
           installTimer = null;
         }
+        clearTimeout(guardTimer);
         unpatches.forEach(function (u) {
           try { u(); } catch (e) {}
         });
         unpatches.length = 0;
         installed = false;
       },
+      settings: SettingsPage,
     },
     __esModule: true,
   };
