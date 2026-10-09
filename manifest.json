@@ -3,6 +3,6 @@
   "description": "Edit how any message looks for you (text and images). Only you see it.",
   "authors": [{ "name": "Abas2" }],
   "main": "index.js",
-  "hash": "75bc152ba2981c57a6be2c39fccc8ff1b79f05164a87596d5de876ed07876fc4",
+  "hash": "b44023d860bd96da29e1a3f30ab7e09d202be22b5b0d1f647cbd9f885b61c6ec",
   "vendetta": { "icon": "ic_message_edit" }
 }
