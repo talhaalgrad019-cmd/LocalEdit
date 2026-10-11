@@ -6,10 +6,8 @@
   const FluxDispatcher = common.FluxDispatcher;
   const React = common.React;
   const RN = common.ReactNative;
-  const { after } = vendetta.patcher;
+  const { before, after } = vendetta.patcher;
   const storage = vendetta.plugin.storage;
-
-  const REAPPLY_TYPES = /^(MESSAGE_CREATE|MESSAGE_UPDATE|LOAD_MESSAGES)/;
 
   const unpatches = [];
   const pending = {};
@@ -141,19 +139,92 @@
       guildId: gid,
       message: out,
       __localEdit: true,
+      otherPluginBypass: true,
     });
   }
 
-  function applyStored(e) {
+  // Last resort when Discord ignores the update event: change the text in its memory directly.
+  // (Shows after you leave the channel and come back.)
+  function forceContent(e) {
+    try {
+      MessageStore = MessageStore || findByStoreName("MessageStore");
+      const m = MessageStore && MessageStore.getMessage(e.channelId, e.id);
+      if (!m) return false;
+      m.content = e.content;
+      if (MessageStore.emitChange) MessageStore.emitChange();
+      return m.content === e.content;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function applyToStore(e) {
+    applyStored(e, storage.variant || "A");
+    setTimeout(function () {
+      try {
+        const info = storeInfo(e.channelId, e.id);
+        if (info.inStore && info.content !== e.content) forceContent(e);
+      } catch (err) {}
+    }, 400);
+  }
+
+  function pick(raw, keys) {
+    const o = {};
+    keys.forEach(function (k) { if (raw && raw[k] !== undefined) o[k] = raw[k]; });
+    return o;
+  }
+
+  // Three ways to build the update, from "everything" to "only the essentials".
+  // We try them in order until Discord accepts one, then remember which.
+  function buildPayload(variant, e) {
+    const base = {
+      id: e.id,
+      channel_id: e.channelId,
+      content: e.content,
+      attachments: e.attachments,
+      edited_timestamp: e.editedAt,
+    };
+    if (variant === "A") return Object.assign({}, e.raw, base);
+    if (variant === "B") {
+      return Object.assign(
+        pick(e.raw, ["type", "author", "timestamp", "tts", "pinned", "flags", "mention_everyone"]),
+        base
+      );
+    }
+    return Object.assign(pick(e.raw, ["author"]), base);
+  }
+
+  function applyStored(e, variant) {
     if (!e || !e.raw) return;
-    sendMessage(
-      Object.assign({}, e.raw, {
-        content: e.content,
-        attachments: e.attachments,
-        edited_timestamp: e.editedAt,
-      }),
-      e.channelId
-    );
+    sendMessage(buildPayload(variant || storage.variant || "A", e), e.channelId);
+  }
+
+  function tryVariants(e) {
+    const bad = storage.badVariants || {};
+    let order = ["A", "B", "C"].filter(function (v) { return !bad[v]; });
+    if (storage.variant && order.indexOf(storage.variant) > 0) {
+      order = [storage.variant].concat(order.filter(function (v) { return v !== storage.variant; }));
+    }
+    let chain = Promise.resolve(null);
+    order.forEach(function (v) {
+      chain = chain.then(function (done) {
+        if (done) return done;
+        storage.trying = v; // if Discord crashes right now, we remember this variant is bad
+        applyStored(e, v);
+        return wait(600).then(function () {
+          const info = storeInfo(e.channelId, e.id);
+          if (info.inStore && info.content === e.content) {
+            storage.variant = v;
+            return v;
+          }
+          return null;
+        });
+      });
+    });
+    return chain.then(function (v) {
+      delete storage.trying;
+      return v;
+    });
   }
 
   function removeEdit(channelId, id) {
@@ -161,49 +232,57 @@
     const k = keyOf(channelId, id);
     const e = all[k];
     if (!e) return false;
-    if (e.raw) sendMessage(e.raw, channelId); // raw = the original, as Discord sent it
+    if (e.raw) {
+      const original = {
+        id: e.id,
+        channelId: e.channelId,
+        raw: e.raw,
+        content: e.raw.content || "",
+        attachments: e.raw.attachments || [],
+        editedAt: e.raw.edited_timestamp || null,
+      };
+      applyStored(original, storage.variant || "A");
+      setTimeout(function () {
+        const info = storeInfo(channelId, id);
+        if (info.inStore && info.content !== original.content) forceContent(original);
+      }, 500);
+    }
     delete all[k];
     return true;
   }
 
-  // Re-apply saved edits when Discord (re)loads those messages
-  function collect(value, out, seen, depth) {
-    if (!value || depth > 8 || out.length >= 200) return out;
-    if (typeof value !== "object" || seen.has(value)) return out;
-    seen.add(value);
-    if (Array.isArray(value)) {
-      for (let i = 0; i < value.length; i++) collect(value[i], out, seen, depth + 1);
-      return out;
-    }
-    if (value.id && (value.channel_id || value.channelId)) out.push(value);
-    const keys = Object.keys(value).slice(0, 40);
-    for (let i = 0; i < keys.length; i++) collect(value[keys[i]], out, seen, depth + 1);
-    return out;
+  // Swap in the edited text whenever Discord loads or updates that message (before the chat sees it)
+  function swapMessage(m, all) {
+    if (!m || !m.id) return m;
+    const e = all[keyOf(m.channel_id || m.channelId, m.id)];
+    if (!e) return m;
+    return Object.assign({}, m, {
+      content: e.content,
+      attachments: e.attachments,
+      edited_timestamp: e.editedAt,
+    });
   }
 
-  function reapply(action) {
+  function interceptAction(action) {
     if (!action || action.__localEdit) return;
     const all = edits();
     if (!Object.keys(all).length) return;
-
-    // opening a channel: re-apply its saved edits once its messages have loaded
-    if (action.type === "CHANNEL_SELECT" && action.channelId) {
-      Object.keys(all).forEach(function (k) {
-        const e = all[k];
-        if (e.channelId !== action.channelId) return;
-        setTimeout(function () { schedule(k + ":select", function () { applyStored(e); }); }, 800);
-      });
-      return;
+    const t = String(action.type);
+    if ((t === "MESSAGE_CREATE" || t === "MESSAGE_UPDATE") && action.message) {
+      action.message = swapMessage(action.message, all);
+    } else if (/^LOAD_MESSAGES/.test(t) && Array.isArray(action.messages)) {
+      action.messages = action.messages.map(function (m) { return swapMessage(m, all); });
     }
+  }
 
-    if (!REAPPLY_TYPES.test(String(action.type))) return;
-    collect(action, [], new Set(), 0).forEach(function (m) {
-      const k = keyOf(m.channel_id || m.channelId, m.id);
+  // Opening a channel: apply its saved edits to messages already in memory
+  function onSelect(action) {
+    if (!action || action.type !== "CHANNEL_SELECT" || !action.channelId) return;
+    const all = edits();
+    Object.keys(all).forEach(function (k) {
       const e = all[k];
-      if (!e) return;
-      if (typeof m.content !== "string" && m.attachments === undefined) return;
-      if (m.content === e.content && attKey(m.attachments) === attKey(e.attachments)) return;
-      schedule(k, function () { applyStored(e); });
+      if (e.channelId !== action.channelId) return;
+      setTimeout(function () { schedule(k + ":select", function () { applyToStore(e); }); }, 800);
     });
   }
 
@@ -257,7 +336,7 @@
   function saveEdit(channelId, raw, text, urls) {
     return buildAttachments(urls, raw.attachments).then(function (atts) {
       const all = edits();
-      all[keyOf(channelId, raw.id)] = {
+      const entry = {
         channelId: channelId,
         id: raw.id,
         raw: raw,
@@ -265,7 +344,8 @@
         attachments: atts,
         editedAt: new Date().toISOString(),
       };
-      applyStored(all[keyOf(channelId, raw.id)]);
+      all[keyOf(channelId, raw.id)] = entry;
+      return entry;
     });
   }
 
@@ -391,32 +471,47 @@
         return;
       }
       busyState[1](true);
-      const before = storeInfo(id.c, id.m);
+      const beforeInfo = storeInfo(id.c, id.m);
+      let method = "none";
       saveEdit(id.c, raw, text, urls)
-        .then(function () { return wait(600); })
-        .then(function () {
-          let info = storeInfo(id.c, id.m);
-          if (info.inStore && info.content !== text) {
-            // try once more in case the first update raced with something
-            applyStored(edits()[keyOf(id.c, id.m)]);
-            return wait(600).then(function () { return storeInfo(id.c, id.m); });
-          }
-          return info;
+        .then(function (entry) {
+          if (!beforeInfo.inStore) return wait(100).then(function () { return storeInfo(id.c, id.m); });
+          return tryVariants(entry).then(function (v) {
+            if (v) {
+              method = "dispatch-" + v;
+              return storeInfo(id.c, id.m);
+            }
+            // Discord ignored every update event: change the text in its memory directly
+            method = forceContent(entry) ? "forced" : "none";
+            return wait(300).then(function () { return storeInfo(id.c, id.m); });
+          });
         })
         .then(function (info) {
           debugRef.current = JSON.stringify(
-            { channel: id.c, message: id.m, expected: text, before: before, after: info },
+            {
+              channel: id.c,
+              message: id.m,
+              expected: text,
+              method: method,
+              variantMemory: storage.variant || null,
+              badVariants: storage.badVariants || {},
+              before: beforeInfo,
+              after: info,
+            },
             null,
             1
           );
           loadedState[1]({ shown: text, edited: true, author: loaded ? loaded.author : "" });
           if (!info.inStore) {
             statusState[1]("Saved, but Discord doesn't have this message loaded right now. Open the channel and scroll to it. The edit applies by itself when it loads.");
-          } else if (info.content === text) {
+          } else if (info.content === text && method.indexOf("dispatch") === 0) {
             statusState[1]("Done. Discord's chat now has the new text. Go back to the channel to see it.");
             toast("Edited locally");
+          } else if (info.content === text && method === "forced") {
+            statusState[1]("Saved. Leave the channel and come back (or restart Discord) to see the new text. It also shows whenever the channel reloads.");
+            toast("Edited locally");
           } else {
-            statusState[1]("Discord ignored the update (its copy still has the old text). Tap Copy debug info and send it to me.");
+            statusState[1]("Saved, but Discord refused the live change. Restart Discord and open the channel: the edit is applied as the messages load. Tap Copy debug info if that fails.");
           }
         })
         .catch(function (e) {
@@ -536,20 +631,21 @@
         // last session ended right after applying an edit: assume it crashed, drop saved edits
         storage.localEdits = {};
         delete storage.guard;
+        if (storage.trying) {
+          storage.badVariants = Object.assign({}, storage.badVariants, { [storage.trying]: true });
+          delete storage.trying;
+        }
         toast("LocalEdit: last edit crashed the chat, saved edits cleared");
       }
 
-      unpatches.push(after("dispatch", FluxDispatcher, function (args) { reapply(args[0]); }));
+      unpatches.push(before("dispatch", FluxDispatcher, function (args) { interceptAction(args[0]); }));
+      unpatches.push(after("dispatch", FluxDispatcher, function (args) { onSelect(args[0]); }));
       installed = true;
 
       if (installTimer) {
         clearInterval(installTimer);
         installTimer = null;
       }
-      Object.keys(edits()).forEach(function (k) {
-        const e = edits()[k];
-        schedule(k, function () { applyStored(e); });
-      });
     } catch (e) {
       console.error("[LocalEdit] install failed", e);
     }
