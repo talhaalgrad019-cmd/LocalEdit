@@ -84,6 +84,15 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
+  // "(edited)" tag on locally edited messages: on by default, toggled from the settings page
+  function showEdited() {
+    return storage.showEdited !== false;
+  }
+
+  function editedTs(e) {
+    return showEdited() ? e.editedAt : (e.raw && e.raw.edited_timestamp) || null;
+  }
+
   function attKey(list) {
     try {
       return Array.from(list || []).map(function (a) { return a && a.url; }).join("|");
@@ -182,7 +191,7 @@
       channel_id: e.channelId,
       content: e.content,
       attachments: e.attachments,
-      edited_timestamp: e.editedAt,
+      edited_timestamp: editedTs(e),
     };
     if (variant === "A") return Object.assign({}, e.raw, base);
     if (variant === "B") {
@@ -259,7 +268,7 @@
     return Object.assign({}, m, {
       content: e.content,
       attachments: e.attachments,
-      edited_timestamp: e.editedAt,
+      edited_timestamp: editedTs(e),
     });
   }
 
@@ -273,6 +282,14 @@
     } else if (/^LOAD_MESSAGES/.test(t) && Array.isArray(action.messages)) {
       action.messages = action.messages.map(function (m) { return swapMessage(m, all); });
     }
+  }
+
+  function reapplyAll() {
+    const all = edits();
+    Object.keys(all).forEach(function (k, i) {
+      const e = all[k];
+      setTimeout(function () { schedule(k + ":tag", function () { applyToStore(e); }); }, i * 150);
+    });
   }
 
   // Opening a channel: apply its saved edits to messages already in memory
@@ -412,6 +429,7 @@
     const busyState = React.useState(false);
     const rawRef = React.useRef(null);
     const debugRef = React.useRef("");
+    const tagState = React.useState(showEdited());
 
     const channelId = channelState[0];
     const messageId = messageState[0];
@@ -520,6 +538,14 @@
         .then(function () { busyState[1](false); });
     }
 
+    function toggleTag() {
+      const next = !tagState[0];
+      storage.showEdited = next;
+      tagState[1](next);
+      reapplyAll();
+      statusState[1]("(edited) tag " + (next ? "ON" : "OFF") + " for all local edits. If the chat doesn't change, leave the channel and come back.");
+    }
+
     function remove() {
       const id = ids();
       if (!id) return;
@@ -539,6 +565,12 @@
         { style: st.hint },
         "Changes how a message looks for you only. Nothing is sent to Discord. Turn on Developer Mode in Discord to copy message IDs."
       ),
+
+      React.createElement(Button, {
+        label: "Show (edited) tag: " + (tagState[0] ? "ON" : "OFF"),
+        kind: tagState[0] ? "primary" : "secondary",
+        onPress: toggleTag,
+      }),
 
       React.createElement(RN.Text, { style: st.label }, "CHANNEL ID (filled with the channel you had open)"),
       React.createElement(RN.TextInput, {
@@ -673,4 +705,4 @@
     },
     __esModule: true,
   };
-})(); 
+})();
