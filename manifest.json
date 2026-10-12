@@ -1,8 +1,8 @@
 {
-  "name": "Edit Messages",
+  "name": "Local Edit",
   "description": "Edit how any message looks for you (text and images). Only you see it.",
-  "authors": [{ "name": "Abas" }],
+  "authors": [{ "name": "Abas2" }],
   "main": "index.js",
-  "hash": "bcd975689d0d447baa7b21477bfc21be2e92b8c2af5e579cd3b081fd762e83d9",
+  "hash": "41c16d0b01deb35b06bd1ac513f1007c77ae5edf3d610ad7ef7c4584b39ea460",
   "vendetta": { "icon": "ic_message_edit" }
 }
